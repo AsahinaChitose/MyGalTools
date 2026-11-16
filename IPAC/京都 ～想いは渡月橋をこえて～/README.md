@@ -4,7 +4,7 @@
 
 | 项目 | 内容 |
 |---|---|
-| 游戏名 | 京都 ～想いは渡月橋をこえて～（Kyoto ~Omoi wa Watatsukibashi o Koete~） |
+| 游戏名 | 京都 ～想いは渡月橋をこえて～（Kyoto ～Omoi wa Watatsukibashi o Koete～） |
 | 厂商 | eLia |
 | 发售 | 2000-10-06（Windows / 640×480 / 全语音） |
 | VNDB | <https://vndb.org/v10027> |
