@@ -47,7 +47,7 @@ import zlib
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 except Exception:
     Image = ImageDraw = ImageFont = ImageFilter = None
 
@@ -59,6 +59,9 @@ STEP_FULL = 189
 
 # 标点：不能按自身 bbox 居中，否则“。”会飘到字框中间。
 PUNCT_EXTRA = set("，。？！、；：…—―・·～〜「」『』（）()《》〈〉【】[]〔〕——")
+
+# 这些符号本身是“居中”的：不能按普通标点的右下偏移，否则会偏下/被切边。
+CENTER_PUNCT = set("・･·•∙⋅―—─")
 
 
 def is_punct(ch: str) -> bool:
@@ -400,7 +403,8 @@ def _load_pairs(path: Path):
 
 def render_ttf_glyph(ch: str, ttf: str, px: int, size: int, kind: str,
                      xoff: int = 0, yoff: int = 0, ttc_index: int = 0,
-                     bold: int = 0, outline: bool = True, stroke: int = 0) -> bytes:
+                     bold: int = 0, outline: bool = True, stroke: int = 0,
+                     outline_width: int | None = None) -> bytes:
     """把 TTF 字符画成游戏字体的 8bpp 数据。
 
     关键 1：游戏位图不是普通灰度图。
@@ -412,6 +416,15 @@ def render_ttf_glyph(ch: str, ttf: str, px: int, size: int, kind: str,
     """
     if ImageFont is None:
         raise FntError("需要 Pillow 才能从 TTF 渲染")
+
+    ow = 2 if size >= 20 else 0
+    if outline_width is not None:
+        ow = max(0, outline_width)
+    if not outline:
+        ow = 0
+    # 原字库的黑色部分 = 1px 四周描边 + 右下 1px 投影，右/下比左/上多 1px。
+    sx = 1 if (size >= 20 and outline) else 0
+    sy = sx
 
     if kind == "half":
         cw = size // 2
@@ -442,11 +455,36 @@ def render_ttf_glyph(ch: str, ttf: str, px: int, size: int, kind: str,
         rw, rh = rb[2] - rb[0], rb[3] - rb[1]
         x = (size - rw) // 2 - rb[0] + xoff
         y = (size - rh) // 2 - rb[1] + yoff
-        if is_punct(ch):
-            x += 2 if size >= 20 else 1
-            y += 1
         kw = {"stroke_width": stroke, "stroke_fill": 0} if stroke else {}
-        d.text((x, y), ch, font=font, fill=0, **kw)
+        if ch in CENTER_PUNCT:
+            # 以“实际墨迹”居中，不按 textbbox：TTF 的 bbox 可能带大量空白，
+            # 按 bbox 居中会让“・”偏高、“―”偏下并切右边。
+            pad = size
+            p2 = px
+            f2 = font
+            bb2 = None
+            w = h = 0
+            while p2 >= 8:
+                f2 = ImageFont.truetype(ttf, p2, index=ttc_index)
+                tmp = Image.new("L", (size * 3, size * 3), 255)
+                ImageDraw.Draw(tmp).text((pad, pad), ch, font=f2, fill=0, **kw)
+                inv = ImageOps.invert(tmp)
+                bb2 = inv.getbbox()
+                if bb2:
+                    w, h = bb2[2] - bb2[0], bb2[3] - bb2[1]
+                    # 墨迹 + 两侧描边都要放得下
+                    if w + 2 * ow <= size and h + 2 * ow <= size:
+                        break
+                p2 -= 1
+            if bb2:
+                x = (size - w) // 2 - (bb2[0] - pad) + xoff
+                y = (size - h) // 2 - (bb2[1] - pad) + yoff
+                ImageDraw.Draw(img).text((x, y), ch, font=f2, fill=0, **kw)
+        else:
+            if is_punct(ch):
+                x += 2 if size >= 20 else 1
+                y += 1
+            d.text((x, y), ch, font=font, fill=0, **kw)
 
     if bold > 0:
         inv = Image.eval(img, lambda p: 255 - p)
@@ -489,13 +527,28 @@ def render_ttf_glyph(ch: str, ttf: str, px: int, size: int, kind: str,
                     d[yy * size + xx + 1] = 255
         return d
 
-    ring = dilate4(core)
+    ring = core
+    for _ in range(ow):
+        ring = dilate4(ring)
+    # 第二层：向右下偏移 1px 的软阴影（96 = 半透明黑），
+    # 与四周围 128 的硬描边区分开，做出原字库那种“两层”立体感。
+    shadow = bytearray(size * size)
+    if sx or sy:
+        for yy in range(size):
+            for xx in range(size):
+                if not ring[yy * size + xx]:
+                    continue
+                tx, ty = xx + sx, yy + sy
+                if 0 <= tx < size and 0 <= ty < size:
+                    shadow[ty * size + tx] = 96
     cell = bytearray(size * size)
     for i in range(size * size):
         if core[i]:
             cell[i] = fill[i]
         elif ring[i]:
             cell[i] = 128
+        elif shadow[i]:
+            cell[i] = 96
     return bytes(cell)
 
 
@@ -521,7 +574,7 @@ def _font_cmap(ttf: str, ttc_index: int):
 
 def patch_full_font(font: BitmapFont, pairs, ttf: str, px: int, xoff: int, yoff: int,
                     ttc_index: int, bold: int, outline: bool = True, verbose: bool = True,
-                    stroke: int = 0):
+                    stroke: int = 0, outline_width: int | None = None):
     """把字体覆盖到的所有可寻址字形槽全部重画一遍，统一风格。"""
     sources = {}
     kinds = {}
@@ -549,7 +602,8 @@ def patch_full_font(font: BitmapFont, pairs, ttf: str, px: int, xoff: int, yoff:
             continue
         try:
             cell = render_ttf_glyph(ch, ttf, px, font.size, kinds.get(idx, "full"),
-                                    xoff, yoff, ttc_index, bold, outline, stroke)
+                                    xoff, yoff, ttc_index, bold, outline, stroke,
+                                    outline_width)
         except (FntError, OSError, ValueError):
             fallback += 1
             continue
@@ -575,7 +629,7 @@ def _resolve_map(path_arg) -> Path:
 
 def patch_font(font: BitmapFont, pairs, ttf: str, px: int, xoff: int, yoff: int,
                ttc_index: int, bold: int, verbose: bool = True, outline: bool = True,
-               stroke: int = 0):
+               stroke: int = 0, outline_width: int | None = None):
     buf = bytearray(font.data)
     patched = skipped = 0
     for src_ch, dst in pairs:
@@ -591,7 +645,8 @@ def patch_font(font: BitmapFont, pairs, ttf: str, px: int, xoff: int, yoff: int,
             if not (0 <= idx < font.count):
                 raise FntError("下标越界 %d" % idx)
             cell = render_ttf_glyph(src_ch[0], ttf, px, font.size,
-                                    kind, xoff, yoff, ttc_index, bold, outline, stroke)
+                                    kind, xoff, yoff, ttc_index, bold, outline, stroke,
+                                    outline_width)
             o = idx * font.glyph_bytes
             buf[o:o + font.glyph_bytes] = cell
             patched += 1
@@ -610,13 +665,15 @@ def cmd_patch(args) -> int:
     if args.all:
         buf, patched, fallback = patch_full_font(font, pairs, args.ttf, px,
                                                  args.xoff, args.yoff, args.ttc_index,
-                                                 args.bold, outline, stroke=args.stroke)
+                                                 args.bold, outline, stroke=args.stroke,
+                                                 outline_width=args.outline_width)
         print("patch-all-glyphs: %d 个字形（TTF 缺字保留 %d）-> %s" %
               (patched, fallback, args.output))
     else:
         buf, patched, skipped = patch_font(font, pairs, args.ttf, px,
                                            args.xoff, args.yoff, args.ttc_index,
-                                           args.bold, outline=outline, stroke=args.stroke)
+                                           args.bold, outline=outline, stroke=args.stroke,
+                                           outline_width=args.outline_width)
         print("patch: %d 个字形, 跳过 %d, 映射 %d 条 -> %s" %
               (patched, skipped, len(pairs), args.output))
     out = Path(args.output)
@@ -655,13 +712,15 @@ def cmd_patch_all(args) -> int:
         if args.all:
             buf, patched, fallback = patch_full_font(font, pairs, args.ttf, px,
                                                      args.xoff, args.yoff, args.ttc_index,
-                                                     args.bold, outline, stroke=args.stroke)
+                                                     args.bold, outline, stroke=args.stroke,
+                                                     outline_width=args.outline_width)
             print("%s: %dx%d, 全字体重画 %d（TTF 缺字保留 %d）-> %s" %
                   (p.name, font.size, font.size, patched, fallback, out / p.name))
         else:
             buf, patched, skipped = patch_font(font, pairs, args.ttf, px,
                                                args.xoff, args.yoff, args.ttc_index,
-                                               args.bold, outline=outline, stroke=args.stroke)
+                                               args.bold, outline=outline, stroke=args.stroke,
+                                               outline_width=args.outline_width)
             print("%s: %dx%d, patch %d, 跳过 %d -> %s" %
                   (p.name, font.size, font.size, patched, skipped, out / p.name))
         dst = out / p.name
@@ -845,6 +904,8 @@ def main(argv=None) -> int:
     p.add_argument("--ttc-index", type=int, default=0)
     p.add_argument("--bold", type=int, default=0)
     p.add_argument("--stroke", type=int, default=0, help="TTF 描边加粗像素（0=原样，1=笔画更粗）")
+    p.add_argument("--outline-width", type=int, default=None,
+                   help="黑色描边宽度；默认 24px=2、12px=0（与原字库一致）")
     p.add_argument("--all", action="store_true", help="重画所有可寻址字形，统一成该 TTF 风格")
     p.add_argument("--no-outline", action="store_true", help="不生成 65..128 的黑色描边")
     p.set_defaults(func=cmd_patch)
@@ -863,6 +924,8 @@ def main(argv=None) -> int:
     p.add_argument("--ttc-index", type=int, default=0)
     p.add_argument("--bold", type=int, default=0)
     p.add_argument("--stroke", type=int, default=0, help="TTF 描边加粗像素（0=原样）")
+    p.add_argument("--outline-width", type=int, default=None,
+                   help="黑色描边宽度；默认 24px=2、12px=0")
     p.add_argument("--all", action="store_true", help="两个字体所有可寻址字形全部重画")
     p.add_argument("--no-outline", action="store_true", help="不生成黑色描边")
     p.set_defaults(func=cmd_patch_all)
